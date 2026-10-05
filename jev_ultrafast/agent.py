@@ -5,22 +5,39 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
+from .governance import GovernanceError
 from .model import action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(
+        self,
+        url,
+        goals,
+        *,
+        record_dir=None,
+        screenshots=False,
+        browser_factory=None,
+        governance=None,
+    ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
+        if governance is not None and browser_factory is None:
+            raise ValueError("Governed runs need a caller-owned isolated browser factory")
         plan = [task]
         self.pending_text = None
-        self.browser = Browser(url)
+        self.guard = governance.start() if governance is not None else None
+        if self.guard:
+            self.guard.checkpoint("before_browser_start", {"url": url})
+        self.browser = (browser_factory or Browser)(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
             page = self.browser.observe(screenshot=self.screenshots)
+            if self.guard:
+                self.guard.checkpoint("after_browser_start", page)
         except Exception:
             self.browser.close()
             raise
@@ -38,6 +55,7 @@ class Agent:
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
+            blocked_reason=None,
         )
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -48,6 +66,22 @@ class Agent:
             **{k: v for k, v in self.state.items() if k != "browser"},
             "elements": action_space(self.state["page"]["actions"])[0],
         }
+
+    def governed_checkpoint(self, stage, page=None):
+        guard = getattr(self, "guard", None)
+        if not guard:
+            return
+        try:
+            guard.checkpoint(stage, page)
+        except GovernanceError as error:
+            self.state["status"] = "blocked"
+            self.state["blocked_reason"] = error.code
+            guard.receipt("run_blocked", stage=stage, reason=error.code, page=page)
+            raise
+
+    def max_steps(self):
+        guard = getattr(self, "guard", None)
+        return guard.policy.max_steps if guard else MAX_STEPS
 
     def command(self, name, body=None):
         body = body or {}
@@ -67,14 +101,18 @@ class Agent:
                 raise ValueError("Start a demo first")
             if state["started_at"] is None:
                 state["started_at"] = time.perf_counter()
+            self.governed_checkpoint("before_model_call", state["page"])
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                self.governed_checkpoint("after_reobserve", state["page"])
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
-            if len(state["decisions"]) >= MAX_STEPS * 2:
+            if len(state["decisions"]) >= self.max_steps() * 2:
                 raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+            next_decision = choose(state["page"], state["goal"], state["history"])
+            self.governed_checkpoint("after_model_call", state["page"])
+            state["decision"] = next_decision
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -91,17 +129,29 @@ class Agent:
             state["decision"] = None
             selected = decision["choice"]
             if selected in {"DONE", "BLOCKED"}:
+                self.governed_checkpoint("before_terminal_decision", page)
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
+                guard = getattr(self, "guard", None)
+                if selected == "DONE" and guard:
+                    try:
+                        guard.verify(page, state["history"])
+                    except GovernanceError as error:
+                        state["status"] = "blocked"
+                        state["blocked_reason"] = error.code
+                        guard.receipt("run_blocked", reason=error.code, page=page)
+                        raise
                 state["status"] = "done" if selected == "DONE" else "blocked"
+                if selected == "BLOCKED":
+                    state["blocked_reason"] = "model_blocked"
                 state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
-            if len(state["history"]) >= MAX_STEPS:
+            if len(state["history"]) >= self.max_steps():
                 state["status"] = "blocked"
-                raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
+                raise ValueError(f"Stopped at the {self.max_steps()}-action demo budget")
             text, helper = None, None
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
@@ -114,6 +164,7 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
+            self.governed_checkpoint("before_browser_action", page)
             state["browser"].act(action, page, text=text)
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
@@ -140,6 +191,7 @@ class Agent:
                 }
             )
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            self.governed_checkpoint("after_browser_action", state["page"])
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
@@ -156,6 +208,16 @@ class Agent:
                 if len(repeated) == 3 and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
                 else "ready"
             )
+            guard = getattr(self, "guard", None)
+            if guard:
+                guard.receipt(
+                    "browser_action_executed",
+                    page=state["page"],
+                    step=len(state["history"]),
+                    kind=action["kind"],
+                    action_id=action["id"],
+                    page_changed=state["history"][-1]["page_changed"],
+                )
         else:
             raise ValueError("Unknown command")
         return self.snapshot()
