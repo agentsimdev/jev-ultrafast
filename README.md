@@ -91,6 +91,18 @@ uv run --env-file .env python examples/run.py \
 
 `uv run --env-file .env python examples/flights.py --keep-open` performs the flight search, checks the actual route/date/results, and saves its trace. It does not select or book a flight.
 
+### AgentSIM governed runs
+
+This fork can wrap the same loop with cancellation, deadlines, exact-host
+routing checks, sanitized receipts, and mandatory independent outcome
+verification. Governed runs require a caller-owned browser factory so they
+cannot silently attach to the default shared local Chrome profile.
+
+These library checks do not create or prove an isolated browser or network
+boundary. The AgentSIM supervisor must provide a per-run browser worker and
+force its traffic through the signed AgentSIM gateway. See
+[the governed runtime boundary](docs/agentsim-governed-runtime.md).
+
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.
